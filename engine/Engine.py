@@ -3,6 +3,19 @@ sys.path.append('..')
 import chess
 from functools import lru_cache
 from numba import njit
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
+import random
+import struct
+from multiprocessing import Array, Process, Queue
+
+# Try to import settings for configuration
+try:
+    import Settings
+    SETTINGS_AVAILABLE = True
+except ImportError:
+    SETTINGS_AVAILABLE = False
 
 # Bitboard helper functions with Numba JIT
 @njit
@@ -48,6 +61,104 @@ KING = 6
 WHITE = 0
 BLACK = 1
 
+# Zobrist hashing for transposition table
+# Generate random 64-bit numbers for each piece/square combination
+ZOBRIST_KEYS = {}
+
+def init_zobrist():
+    """Initialize Zobrist keys for hashing."""
+    global ZOBRIST_KEYS
+    random.seed(12345)  # Fixed seed for reproducibility
+    
+    # Keys for each piece type on each square for each color
+    for color in [WHITE, BLACK]:
+        for piece_type in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING]:
+            for square in range(64):
+                ZOBRIST_KEYS[(color, piece_type, square)] = random.getrandbits(64)
+    
+    # Keys for castling rights
+    ZOBRIST_KEYS['castling'] = {
+        (WHITE, 'kingside'): random.getrandbits(64),
+        (WHITE, 'queenside'): random.getrandbits(64),
+        (BLACK, 'kingside'): random.getrandbits(64),
+        (BLACK, 'queenside'): random.getrandbits(64)
+    }
+    
+    # Keys for en passant file
+    ZOBRIST_KEYS['enpassant'] = {}
+    for file in range(8):
+        ZOBRIST_KEYS['enpassant'][file] = random.getrandbits(64)
+    
+    # Key for turn
+    ZOBRIST_KEYS['turn'] = random.getrandbits(64)
+
+# Initialize Zobrist keys
+init_zobrist()
+
+# Shared transposition table structure
+# We'll pack: hash (64-bit), depth (8-bit), score (16-bit), flag (4-bit), best_move (8-bit)
+# But for simplicity, we'll use separate arrays for each component
+class SharedTranspositionTable:
+    def __init__(self, size=1000000):
+        self.size = size
+        # Use shared memory arrays for cross-process access
+        self.hashes = Array('Q', [0] * size)  # 64-bit unsigned long for hashes
+        self.depths = Array('B', [0] * size)  # 8-bit unsigned char for depths
+        self.scores = Array('h', [0] * size)  # 16-bit signed short for scores
+        self.flags = Array('B', [0] * size)   # 8-bit unsigned char for flags
+        self.best_moves = Array('I', [0] * size)  # 32-bit unsigned int for best moves
+    
+    def store(self, hash_key, depth, score, flag, best_move):
+        """Store an entry in the transposition table."""
+        index = hash_key % self.size
+        self.hashes[index] = hash_key
+        self.depths[index] = depth
+        self.scores[index] = score
+        self.flags[index] = flag
+        self.best_moves[index] = best_move
+    
+    def lookup(self, hash_key):
+        """Look up an entry in the transposition table."""
+        index = hash_key % self.size
+        if self.hashes[index] == hash_key:
+            return {
+                'depth': self.depths[index],
+                'score': self.scores[index],
+                'flag': self.flags[index],
+                'best_move': self.best_moves[index]
+            }
+        return None
+
+def lazy_smp_worker(shared_tt, task_queue, result_queue, worker_id, depth, board_fen):
+    """Lazy SMP worker process - runs identical search with minor variations."""
+    # Prevent pygame initialization in worker processes
+    import os
+    os.environ['SDL_VIDEODRIVER'] = 'dummy'
+    
+    # Create engine instance for this worker
+    worker_engine = ChessEngine(depth=depth, quiet=True)
+    worker_engine.worker_id = worker_id  # Set worker ID for move ordering variations
+    worker_engine.shared_tt = shared_tt  # Use shared transposition table
+    
+    # Set up board from FEN
+    worker_engine.chess_board = chess.Board(board_fen)
+    worker_engine.sync_from_chess_board()
+    
+    while True:
+        try:
+            task = task_queue.get(timeout=1)
+            if task is None:  # Poison pill to stop worker
+                break
+            
+            # Perform search with worker-specific variations
+            best_move = worker_engine.search(worker_engine.chess_board)
+            result_queue.put((worker_id, best_move))
+            
+        except Exception as e:
+            if task is None:
+                break
+            result_queue.put((worker_id, None))  # Error signal
+
 # Piece letters for display
 PIECE_LETTERS = {
     (WHITE, PAWN): 'P',
@@ -91,10 +202,46 @@ class ChessEngine:
         self.top_moves_cache = []
         self.principal_variations_cache = []
         self.realtime_callback = None
+        self.best_score_so_far = float('-inf')  # Track best score to only update on improvements
         
-        # Transposition table for performance
+        # Transposition table for performance - increased size for better memory utilization
+        # Use settings if available, otherwise use defaults
+        if SETTINGS_AVAILABLE and hasattr(Settings, 'transposition_table_size'):
+            tt_size = Settings.transposition_table_size
+        else:
+            tt_size = 1000000  # Maximum number of entries (increased from 10,000)
+        
+        # Create shared transposition table for Lazy SMP
+        self.shared_tt = SharedTranspositionTable(tt_size)
+        self.tt_size = tt_size
+        
+        # Legacy transposition table for fallback
         self.transposition_table = {}
-        self.tt_size = 10000  # Maximum number of entries
+        
+        # Lazy SMP settings
+        if SETTINGS_AVAILABLE and hasattr(Settings, 'use_lazy_smp'):
+            self.use_lazy_smp = Settings.use_lazy_smp
+        else:
+            self.use_lazy_smp = True  # Enable Lazy SMP by default
+        
+        if SETTINGS_AVAILABLE and hasattr(Settings, 'num_workers') and Settings.num_workers is not None:
+            self.num_workers = Settings.num_workers
+        else:
+            self.num_workers = max(1, multiprocessing.cpu_count())  # Use all available cores
+        
+        # Worker ID for move ordering variations (0 = main process)
+        self.worker_id = 0
+        
+        # Memory and CPU usage configuration
+        if SETTINGS_AVAILABLE and hasattr(Settings, 'max_cache_size'):
+            self.max_cache_size = Settings.max_cache_size
+        else:
+            self.max_cache_size = 100000  # Maximum LRU cache size for material evaluation
+        
+        if SETTINGS_AVAILABLE and hasattr(Settings, 'enable_aggressive_caching'):
+            self.enable_aggressive_caching = Settings.enable_aggressive_caching
+        else:
+            self.enable_aggressive_caching = True  # Enable aggressive caching for performance
         
         # Board state - bitboard representation
         # One bitboard per piece type per color
@@ -123,6 +270,42 @@ class ChessEngine:
         # Initialize board to starting position for move generation
         self.chess_board = chess.Board()
         self.reset_board()
+    
+    def configure_performance(self, tt_size=None, max_cache_size=None, enable_aggressive_caching=None, 
+                              use_lazy_smp=None, num_workers=None):
+        """Configure performance settings at runtime."""
+        if tt_size is not None:
+            self.tt_size = tt_size
+            # Create new shared transposition table when size changes
+            self.shared_tt = SharedTranspositionTable(tt_size)
+            self.transposition_table.clear()
+        
+        if max_cache_size is not None:
+            self.max_cache_size = max_cache_size
+            # Clear cache when size changes
+            self.evaluate_material_cached.cache_clear()
+        
+        if enable_aggressive_caching is not None:
+            self.enable_aggressive_caching = enable_aggressive_caching
+        
+        if use_lazy_smp is not None:
+            self.use_lazy_smp = use_lazy_smp
+        
+        if num_workers is not None:
+            self.num_workers = num_workers
+    
+    def get_performance_config(self):
+        """Get current performance configuration."""
+        return {
+            'transposition_table_size': self.tt_size,
+            'max_cache_size': self.max_cache_size,
+            'enable_aggressive_caching': self.enable_aggressive_caching,
+            'use_lazy_smp': self.use_lazy_smp,
+            'num_workers': self.num_workers,
+            'cpu_count': multiprocessing.cpu_count(),
+            'shared_tt_size': self.shared_tt.size,
+            'cache_info': self.evaluate_material_cached.cache_info()._asdict()
+        }
     
     def clear_move_ordering_cache(self):
         """Clear the move ordering cache (call when board changes)"""
@@ -686,7 +869,7 @@ class ChessEngine:
         self.sync_to_chess_board()
         return self.chess_board.is_stalemate()
     
-    @lru_cache(maxsize=1024)
+    @lru_cache(maxsize=None)  # We'll manage cache size manually
     def evaluate_material_cached(self, board_tuple, turn):
         """Cached material evaluation for performance using bitboards"""
         white_score = 0
@@ -731,6 +914,14 @@ class ChessEngine:
         """Material evaluation with strong tactical capture priority"""
         # Convert board to tuple for caching
         board_tuple = tuple(tuple(row) for row in self.board)
+        
+        # Manage cache size if aggressive caching is enabled
+        if self.enable_aggressive_caching:
+            cache_info = self.evaluate_material_cached.cache_info()
+            if cache_info.currsize > self.max_cache_size:
+                # Clear cache when it exceeds maximum size
+                self.evaluate_material_cached.cache_clear()
+        
         return self.evaluate_material_cached(board_tuple, self.turn)
     
     def quiescence_search(self, alpha, beta, ply_count):
@@ -781,18 +972,43 @@ class ChessEngine:
         return alpha if self.turn == WHITE else beta
     
     def get_board_hash(self):
-        """Generate a simple hash of the board position for transposition table."""
-        board_tuple = tuple(tuple(row) for row in self.board)
-        return hash((board_tuple, self.turn))
+        """Generate Zobrist hash of the board position for transposition table."""
+        hash_key = 0
+    
+        # XOR in pieces
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row][col]
+                if piece != (WHITE, EMPTY) and piece != (BLACK, EMPTY):
+                    color, piece_type = piece
+                    square = row * 8 + col
+                    hash_key ^= ZOBRIST_KEYS[(color, piece_type, square)]
+    
+        # XOR in castling rights
+        for color in [WHITE, BLACK]:
+            if self.castling_rights[color]['kingside']:
+                hash_key ^= ZOBRIST_KEYS['castling'][(color, 'kingside')]
+            if self.castling_rights[color]['queenside']:
+                hash_key ^= ZOBRIST_KEYS['castling'][(color, 'queenside')]
+    
+        # XOR in en passant square
+        if self.en_passant_square:
+            ep_file = self.en_passant_square[1]
+            hash_key ^= ZOBRIST_KEYS['enpassant'][ep_file]
+    
+        # XOR in turn
+        if self.turn == BLACK:
+            hash_key ^= ZOBRIST_KEYS['turn']
+    
+        return hash_key
     
     def minimax(self, ply, alpha, beta, is_maximizing, ply_count=0):
         """Minimax with alpha-beta pruning, move ordering, transposition table, and null-move pruning"""
-        # Check transposition table
+        # Check shared transposition table
         board_hash = self.get_board_hash()
-        if board_hash in self.transposition_table:
-            cached_depth, cached_score = self.transposition_table[board_hash]
-            if cached_depth >= ply:
-                return cached_score
+        tt_entry = self.shared_tt.lookup(board_hash)
+        if tt_entry and tt_entry['depth'] >= ply:
+            return tt_entry['score']
         
         if ply == 0:
             return self.quiescence_search(alpha, beta, ply_count)
@@ -833,31 +1049,62 @@ class ChessEngine:
         
         if is_maximizing:
             max_eval = float('-inf')
-            for move in legal_moves:
+            best_move = None
+            for i, move in enumerate(legal_moves):
                 if self.make_move(move, temporary=True):
                     eval_score = self.minimax(ply - 1, alpha, beta, False, ply_count + 1)
                     self.unmake_move(temporary=True)
-                    max_eval = max(max_eval, eval_score)
+                    if eval_score > max_eval:
+                        max_eval = eval_score
+                        best_move = move
+                        
+                        # Only update callback if this is a significant improvement
+                        if self.realtime_callback and eval_score > self.best_score_so_far + 10:  # 10 centipawn threshold
+                            try:
+                                chess_move = self.custom_to_chess_move(move)
+                                # Only callback if move is legal in current position
+                                if chess_move in self.chess_board.legal_moves:
+                                    self.realtime_callback(chess_move, eval_score)
+                                    self.best_score_so_far = eval_score
+                            except:
+                                pass
+                    
                     alpha = max(alpha, eval_score)
                     if beta <= alpha:
                         break
-            # Store in transposition table
-            if len(self.transposition_table) < self.tt_size:
-                self.transposition_table[board_hash] = (ply, max_eval)
+            # Store in shared transposition table
+            # Flag: 0 = exact, 1 = lower bound, 2 = upper bound
+            flag = 0 if max_eval > alpha and max_eval < beta else (1 if max_eval >= beta else 2)
+            self.shared_tt.store(board_hash, ply, max_eval, flag, 0)  # Simplified best_move for now
             return max_eval
         else:
             min_eval = float('inf')
-            for move in legal_moves:
+            best_move = None
+            for i, move in enumerate(legal_moves):
                 if self.make_move(move, temporary=True):
                     eval_score = self.minimax(ply - 1, alpha, beta, True, ply_count + 1)
                     self.unmake_move(temporary=True)
-                    min_eval = min(min_eval, eval_score)
+                    if eval_score < min_eval:
+                        min_eval = eval_score
+                        best_move = move
+                        
+                        # Only update callback if this is a significant improvement
+                        if self.realtime_callback and eval_score < self.best_score_so_far - 10:  # 10 centipawn threshold
+                            try:
+                                chess_move = self.custom_to_chess_move(move)
+                                # Only callback if move is legal in current position
+                                if chess_move in self.chess_board.legal_moves:
+                                    self.realtime_callback(chess_move, eval_score)
+                                    self.best_score_so_far = eval_score
+                            except:
+                                pass
+                    
                     beta = min(beta, eval_score)
                     if beta <= alpha:
                         break
-            # Store in transposition table
-            if len(self.transposition_table) < self.tt_size:
-                self.transposition_table[board_hash] = (ply, min_eval)
+            # Store in shared transposition table
+            flag = 0 if min_eval > alpha and min_eval < beta else (1 if min_eval >= beta else 2)
+            self.shared_tt.store(board_hash, ply, min_eval, flag, 0)  # Simplified best_move for now
             return min_eval
     
     def order_moves(self, moves):
@@ -873,10 +1120,19 @@ class ChessEngine:
             if move_key in self.move_ordering_cache:
                 score = self.move_ordering_cache[move_key]
             else:
+                # Piece development bonus: prefer moving less valuable pieces
+                attacker_color, attacker_type = self.board[from_sq[0]][from_sq[1]]
+                if attacker_type != EMPTY:
+                    attacker_value = PIECE_VALUES[attacker_type]
+                    # Higher bonus for lower-valued pieces (encourages development)
+                    if attacker_value < 500:  # Pawn, Knight, Bishop
+                        score += (500 - attacker_value) // 2  # Bonus inversely proportional to value
+                    elif attacker_value >= 900:  # Queen
+                        score -= 50  # Penalty for moving queen early
+                
                 # Prioritize captures (MVV-LVA: Most Valuable Victim - Least Valuable Attacker)
                 if self.board[to_sq[0]][to_sq[1]] != (WHITE, EMPTY) and self.board[to_sq[0]][to_sq[1]] != (BLACK, EMPTY):
                     victim_color, victim_type = self.board[to_sq[0]][to_sq[1]]
-                    attacker_color, attacker_type = self.board[from_sq[0]][from_sq[1]]
                     # Ensure attacker is not empty
                     if attacker_type != EMPTY:
                         score = PIECE_VALUES[victim_type] * 10 - PIECE_VALUES[attacker_type]
@@ -885,13 +1141,16 @@ class ChessEngine:
                 if promotion:
                     score += PIECE_VALUES[promotion] * 5
                 
-                # Prioritize checks
+                # Prioritize checkmate
                 if self.make_move(move, temporary=True):
                     if self.is_checkmate():
                         score += 10000  # Checkmate is best
-                    elif self.is_in_check(self.turn):
-                        score += 50  # Give check
                     self.unmake_move(temporary=True)
+            
+            # Add worker-specific variation for Lazy SMP
+            # Small random variation based on worker_id to diversify search
+            if self.worker_id > 0:
+                score += (self.worker_id * 7) % 13  # Small pseudo-random variation
             
             move_order.append((move, score))
         
@@ -910,14 +1169,38 @@ class ChessEngine:
         # Order moves for better pruning
         ordered_moves = self.order_moves(legal_moves)
         
+        # Track recent moves for repetition detection
+        recent_moves = []
+        # Use chess board's move_stack if available
+        if hasattr(self, 'chess_board') and self.chess_board:
+            for i in range(min(6, len(self.chess_board.move_stack))):
+                recent_moves.append(self.chess_board.move_stack[-i-1])
+        
         move_scores = []
         plies = self.depth * 2  # Use engine's depth, not Settings
         is_white_turn = (self.turn == WHITE)
         
         for move in ordered_moves:
+            # Add repetition penalty
+            repetition_penalty = 0
+            
+            # Penalty for undoing previous move
+            if recent_moves:
+                last_move = recent_moves[0]
+                if (move[3] == last_move[0] and move[0] == last_move[2]):  # to_square == from_square, from_square == to_square
+                    repetition_penalty -= 150
+                
+                # Penalty for moving same piece again (starts where last move ended)
+                if move[2] == last_move[3]:  # from_square == last_move.to_square
+                    repetition_penalty -= 120
+                
+                # Penalty for recent repetition
+                if recent_moves and move in recent_moves:
+                    repetition_penalty -= 150
+            
             if self.make_move(move, temporary=True):
                 # After making move, turn flips, so we pass the opposite
-                score = self.minimax(plies - 1, float('-inf'), float('inf'), not is_white_turn, 1)
+                score = self.minimax(plies - 1, float('-inf'), float('inf'), not is_white_turn, 1) + repetition_penalty
                 self.unmake_move(temporary=True)
                 move_scores.append((move, score))
                 
@@ -1003,6 +1286,9 @@ class ChessEngine:
             self.en_passant_square = (ep_row, ep_col)
         else:
             self.en_passant_square = None
+        
+        # Sync the chess_board for repetition detection
+        self.chess_board = actual_board.copy()
     
     def custom_to_chess_move(self, custom_move):
         """Convert custom engine move format to chess.Move."""
@@ -1055,9 +1341,69 @@ class ChessEngine:
         return ((from_row, from_col), (to_row, to_col), promotion)
     
     def search(self, chess_board):
+        """Search function compatible with analyzer interface with Lazy SMP."""
+        # Convert chess board to custom engine format
+        self.chess_to_custom_board(chess_board)
+        
+        # Use Lazy SMP if enabled and we have multiple workers
+        if self.use_lazy_smp and self.num_workers > 1:
+            return self.search_lazy_smp(chess_board)
+        
+        # Fallback to single-process iterative deepening
+        return self.search_single_process(chess_board)
+    
+    def search_lazy_smp(self, chess_board):
+        """Search using Lazy SMP - multiple workers with shared transposition table."""
+        board_fen = self.chess_board.fen()
+        task_queue = Queue()
+        result_queue = Queue()
+        
+        # Start worker processes
+        workers = []
+        for i in range(self.num_workers):
+            p = Process(target=lazy_smp_worker, 
+                       args=(self.shared_tt, task_queue, result_queue, i + 1, self.depth, board_fen))
+            p.start()
+            workers.append(p)
+        
+        # Give workers time to start and begin searching
+        import time
+        time.sleep(0.1)
+        
+        # Wait for results from workers
+        best_move = None
+        timeout = self.search_time if hasattr(self, 'search_time') else 5.0
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                worker_id, move = result_queue.get(timeout=0.5)
+                if move is not None:
+                    best_move = move  # Take first valid result
+                    break
+            except:
+                continue
+        
+        # Stop workers
+        for _ in range(self.num_workers):
+            task_queue.put(None)  # Poison pill
+        
+        for p in workers:
+            p.join(timeout=1.0)
+        
+        # Fallback to single process if no result
+        if best_move is None:
+            return self.search_single_process(chess_board)
+        
+        return best_move
+    
+    def search_single_process(self, chess_board):
         """Search function compatible with analyzer interface with iterative deepening."""
         # Convert chess board to custom engine format
         self.chess_to_custom_board(chess_board)
+        
+        # Reset best score tracking for new search
+        self.best_score_so_far = float('-inf')
         
         # Implement iterative deepening for real-time updates
         max_depth = self.depth * 2  # Convert to plies
@@ -1083,9 +1429,9 @@ class ChessEngine:
             # Reset depth for next iteration
             self.depth = original_depth
             
-            # Evaluate each move and populate cache
+            # Evaluate each move and populate cache with real-time updates
             current_top_moves = []
-            for custom_move in ranked_custom_moves:
+            for i, custom_move in enumerate(ranked_custom_moves):
                 chess_move = self.custom_to_chess_move(custom_move)
                 # Get evaluation for this move
                 self.chess_to_custom_board(chess_board)
@@ -1093,25 +1439,37 @@ class ChessEngine:
                     score = self.evaluate_material()
                     self.unmake_move(temporary=True)
                     current_top_moves.append((chess_move, score))
+                    
+                    # Update best move immediately if this is better
+                    if i == 0 or score > best_score:
+                        best_chess_move = chess_move
+                        best_score = score
+                        
+                        # Update cache with current best
+                        self.top_moves_cache = current_top_moves.copy()
+                        
+                        # Generate PV for current best move
+                        self.principal_variations_cache = []
+                        for j, (cm, cs) in enumerate(current_top_moves[:3]):
+                            pv_line = self.generate_pv_line(cm, depth=5)
+                            self.principal_variations_cache.append(pv_line)
+                        
+                        # Call realtime callback immediately when we find a better move
+                        if self.realtime_callback and score > self.best_score_so_far + 10:
+                            # Only callback if move is legal in current position
+                            if chess_move in self.chess_board.legal_moves:
+                                self.realtime_callback(chess_move, best_score)
+                                self.best_score_so_far = score
             
-            # Update top moves cache with latest results
+            # Final update for this depth
             self.top_moves_cache = current_top_moves
             
-            # Get best move from current iteration
-            if current_top_moves:
-                best_chess_move = current_top_moves[0][0]
-                best_score = current_top_moves[0][1]
-                
-                # Generate principal variations for current depth
-                self.principal_variations_cache = []
-                for i, (chess_move, score) in enumerate(current_top_moves[:3]):
-                    # Generate a simple PV line by following best responses
-                    pv_line = self.generate_pv_line(chess_move, depth=5)
-                    self.principal_variations_cache.append(pv_line)
-                
-                # Call realtime callback if set
-                if self.realtime_callback:
-                    self.realtime_callback(best_chess_move, best_score)
+            # Generate principal variations for current depth
+            self.principal_variations_cache = []
+            for i, (chess_move, score) in enumerate(current_top_moves[:3]):
+                # Generate a simple PV line by following best responses
+                pv_line = self.generate_pv_line(chess_move, depth=5)
+                self.principal_variations_cache.append(pv_line)
         
         # Keep current_search_depth at max depth for analyzer to show
         # Don't reset to 0 so analyzer can show the final depth

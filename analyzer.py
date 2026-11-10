@@ -6,8 +6,10 @@ import threading
 import time
 import argparse
 from board import Board
-from engine.Engine import ChessEngine
+from engine.engine_selector import get_engine
 import board_renderer
+
+
 
 # ── Colours ───────────────────────────────────────────────────────────────
 # Modern ChessKit-inspired color scheme
@@ -65,7 +67,7 @@ def px_to_sq(x: int, y: int, flipped: bool = False) -> int:
 
 
 class ChessAnalyzer:
-    def __init__(self, quiet=False):
+    def __init__(self, quiet=False, use_python=True):
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chess Position Analyzer")
@@ -73,7 +75,7 @@ class ChessAnalyzer:
         
         # Analyzer-specific depth setting (independent of Settings.py)
         # Use higher depth for iterative deepening - will search until stopped
-        self.analyzer_depth = 20  # Will search iteratively to this depth
+        self.analyzer_depth = 25  # Will search iteratively to this depth (increased from 20)
         
         # Fonts
         self.piece_font = pygame.font.SysFont('Arial', 48, bold=True)
@@ -113,13 +115,21 @@ class ChessAnalyzer:
         self.legal_targets = []
         self.last_move = None
         
-        # Engine for analysis - use custom chess engine directly
-        # Use analyzer's own depth setting, independent of Settings.py
-        self.engine = ChessEngine(depth=self.analyzer_depth, use_backward_search=False, search_time=1.0, realtime=True, quiet=self.quiet)
-        self.engine.use_opening_book = False  # Disable opening book for analyzer
+        # Store engine selection preference
+        self.use_python = use_python
         
-        # Set real-time callback
-        self.engine.set_realtime_callback(self.on_better_move_found)
+        # Engine for analysis - use engine selector to choose Python/C++
+        # Use analyzer's own depth setting, independent of Settings.py
+        self.engine = get_engine(depth=self.analyzer_depth, use_backward_search=False, 
+                                search_time=1.0, realtime=True, quiet=self.quiet, use_python=self.use_python)
+        
+        # C++ engine doesn't have use_opening_book, so handle gracefully
+        if hasattr(self.engine, 'use_opening_book'):
+            self.engine.use_opening_book = False  # Disable opening book for analyzer
+        
+        # Set real-time callback (only if engine supports it)
+        if hasattr(self.engine, 'set_realtime_callback'):
+            self.engine.set_realtime_callback(self.on_better_move_found)
         
         # Analysis results
         self.best_move = None
@@ -153,8 +163,15 @@ class ChessAnalyzer:
         
     def on_better_move_found(self, move, score):
         """Callback when engine finds a better move."""
-        self.best_move = move
-        self.evaluation = score
+        # Only update if the move is legal in the current position
+        if move in self.board.board.legal_moves:
+            self.best_move = move
+            # Adjust evaluation based on whose turn it is
+            # If it's black's turn, negate the score (engine always evaluates from white's perspective)
+            if self.board.board.turn == chess.BLACK:
+                self.evaluation = -score
+            else:
+                self.evaluation = score
         
         # Detect mate
         self.mate_in = None
@@ -188,6 +205,9 @@ class ChessAnalyzer:
                 self.win_rate = 100  # White mates
             else:
                 self.win_rate = 0  # Black mates
+        
+        # Update analysis depth from engine
+        self.analysis_depth = self.engine.current_search_depth
         
         # In quiet mode, don't print anything here (handled in continuous_analysis)
     
@@ -236,52 +256,79 @@ class ChessAnalyzer:
                 # Update engine depth for this iteration
                 self.engine.depth = current_depth
                 
-                # Get best move at current depth
+                # Get best move at current depth (engine's search handles real-time updates via callback)
                 best_move = self.engine.search(self.board.board)
                 
-                # Get current analysis data
+                # Get current analysis data (updated in real-time by callback)
                 analysis_data = self.engine.get_current_analysis()
                 
-                # Update analyzer state
-                self.best_move = analysis_data['best_move']
-                self.evaluation = analysis_data['evaluation']
-                top_moves = analysis_data['top_moves']
-                self.principal_variations = analysis_data['principal_variations']
-                self.analysis_depth = analysis_data['depth']
-                
-                # Detect mate
-                self.mate_in = None
-                if abs(self.evaluation) > 50000:
-                    if self.evaluation > 0:
-                        self.mate_in = (100000 - self.evaluation + 1) // 2
+                # Update analyzer state only if we have valid data
+                if analysis_data['best_move'] is not None:
+                    # Validate that best move is legal in current position
+                    if analysis_data['best_move'] in self.board.board.legal_moves:
+                        self.best_move = analysis_data['best_move']
+                        # Adjust evaluation based on whose turn it is
+                        if self.board.board.turn == chess.BLACK:
+                            self.evaluation = -analysis_data['evaluation']
+                        else:
+                            self.evaluation = analysis_data['evaluation']
                     else:
-                        self.mate_in = -(100000 + self.evaluation + 1) // 2
-                
-                # Set second and third best moves
-                if len(top_moves) >= 2:
-                    self.second_best_move = top_moves[1][0]
-                else:
+                        # If best move is not legal, clear it
+                        self.best_move = None
+                        self.evaluation = 0.0
+                    
+                    top_moves = analysis_data['top_moves']
+                    self.principal_variations = analysis_data['principal_variations']
+                    self.analysis_depth = analysis_data['depth']
+                    
+                    # Detect mate
+                    self.mate_in = None
+                    if abs(self.evaluation) > 50000:
+                        if self.evaluation > 0:
+                            self.mate_in = (100000 - self.evaluation + 1) // 2
+                        else:
+                            self.mate_in = -(100000 + self.evaluation + 1) // 2
+                    
+                    # Set second and third best moves (ensure they're legal and different from best)
                     self.second_best_move = None
-                if len(top_moves) >= 3:
-                    self.third_best_move = top_moves[2][0]
-                else:
                     self.third_best_move = None
-                
-                # Calculate win rate
-                if self.mate_in is None:
-                    self.win_rate = 100 / (1 + 2.71828 ** (-self.evaluation / 200))
-                    self.win_rate = max(0, min(100, self.win_rate))
-                else:
-                    if self.mate_in > 0:
-                        self.win_rate = 100
+                    
+                    current_legal_moves = set(move.uci() for move in self.board.board.legal_moves)
+                    
+                    if self.best_move:
+                        unique_moves = [self.best_move.uci()]
+                        
+                        if len(top_moves) >= 2:
+                            for i in range(1, len(top_moves)):
+                                move_uci = top_moves[i][0].uci()
+                                if move_uci not in unique_moves and move_uci in current_legal_moves:
+                                    self.second_best_move = top_moves[i][0]
+                                    unique_moves.append(move_uci)
+                                    break
+                        
+                        if len(top_moves) >= 3:
+                            for i in range(1, len(top_moves)):
+                                move_uci = top_moves[i][0].uci()
+                                if move_uci not in unique_moves and move_uci in current_legal_moves:
+                                    self.third_best_move = top_moves[i][0]
+                                    unique_moves.append(move_uci)
+                                    break
+                    
+                    # Calculate win rate
+                    if self.mate_in is None:
+                        self.win_rate = 100 / (1 + 2.71828 ** (-self.evaluation / 200))
+                        self.win_rate = max(0, min(100, self.win_rate))
                     else:
-                        self.win_rate = 0
+                        if self.mate_in > 0:
+                            self.win_rate = 100
+                        else:
+                            self.win_rate = 0
                 
                 if not self.quiet:
                     print(f"Depth {current_depth}: {self.best_move}, eval: {self.evaluation}")
                 
                 # Small delay between depths to allow UI updates
-                time.sleep(0.05)
+                time.sleep(0.01)  # Reduced delay for faster updates
                 
         except Exception as e:
             if not self.quiet:
@@ -404,6 +451,7 @@ class ChessAnalyzer:
                         self.last_move = move
                         self.selected_sq = None
                         self.legal_targets = []
+                        
                         # Clear analysis results immediately when move is made
                         self.best_move = None
                         self.second_best_move = None
@@ -412,6 +460,15 @@ class ChessAnalyzer:
                         self.win_rate = 50.0
                         self.mate_in = None
                         self.principal_variations = []
+                        
+                        # Pick an instant random best move for immediate feedback
+                        legal_moves = list(self.board.board.legal_moves)
+                        if legal_moves:
+                            import random
+                            self.best_move = random.choice(legal_moves)
+                            self.evaluation = 0.0  # Neutral evaluation for random move
+                            self.win_rate = 50.0
+                        
                         # Trigger new analysis after move
                         self.board_changed = True
                         break
@@ -465,6 +522,14 @@ class ChessAnalyzer:
         self.win_rate = 50.0
         self.mate_in = None
         self.principal_variations = []
+        
+        # Pick an instant random best move for immediate feedback
+        legal_moves = list(self.board.board.legal_moves)
+        if legal_moves:
+            import random
+            self.best_move = random.choice(legal_moves)
+            self.evaluation = 0.0  # Neutral evaluation for random move
+            self.win_rate = 50.0
         
         # Trigger new analysis after playing PV line
         self.board_changed = True
@@ -545,7 +610,7 @@ class ChessAnalyzer:
             y += 28
         
         # Second best move with Material UI amber
-        if self.second_best_move:
+        if self.second_best_move and self.second_best_move != self.best_move:
             try:
                 second_san = self.board.board.san(self.second_best_move)
                 second_text = self.ui_font.render(f"2nd: {second_san}", True, (255, 193, 7))
@@ -557,7 +622,7 @@ class ChessAnalyzer:
             y += 28
         
         # Third best move with Material UI orange
-        if self.third_best_move:
+        if self.third_best_move and self.third_best_move != self.best_move and self.third_best_move != self.second_best_move:
             try:
                 third_san = self.board.board.san(self.third_best_move)
                 third_text = self.ui_font.render(f"3rd: {third_san}", True, (255, 152, 0))
@@ -655,12 +720,35 @@ class ChessAnalyzer:
         # Draw board
         # Pass top 3 moves with their evaluations for arrows of different thickness
         top_moves_list = []
-        if self.best_move:
-            top_moves_list.append((self.best_move, self.evaluation))
-        if self.second_best_move:
-            top_moves_list.append((self.second_best_move, self.evaluation))
-        if self.third_best_move:
-            top_moves_list.append((self.third_best_move, self.evaluation))
+        
+        # Get current legal moves for validation
+        current_legal_moves = set(self.board.board.legal_moves)
+        
+        # Collect all unique legal moves
+        unique_moves = []
+        move_set = set()
+        
+        # Only add moves that are legal in the current position
+        if self.best_move and self.best_move in current_legal_moves:
+            move_uci = self.best_move.uci()
+            if move_uci not in move_set:
+                unique_moves.append((self.best_move, self.evaluation))
+                move_set.add(move_uci)
+        
+        if self.second_best_move and self.second_best_move in current_legal_moves:
+            move_uci = self.second_best_move.uci()
+            if move_uci not in move_set:
+                unique_moves.append((self.second_best_move, self.evaluation))
+                move_set.add(move_uci)
+        
+        if self.third_best_move and self.third_best_move in current_legal_moves:
+            move_uci = self.third_best_move.uci()
+            if move_uci not in move_set:
+                unique_moves.append((self.third_best_move, self.evaluation))
+                move_set.add(move_uci)
+        
+        # Take top 3 unique moves
+        top_moves_list = unique_moves[:3]
         
         board_renderer.draw_board(
             self.screen,
@@ -721,7 +809,21 @@ class ChessAnalyzer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Chess Position Analyzer')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
+    parser.add_argument('--python', type=str, default='true',
+                       help='Use Python engine (true) or C++ engine (false)')
+    parser.add_argument('--compile-cpp', action='store_true',
+                       help='Compile C++ engine')
     args = parser.parse_args()
     
-    analyzer = ChessAnalyzer(quiet=args.quiet)
+    # Convert string to bool
+    use_python = args.python.lower() in ['true', '1', 'yes', 'y']
+    
+    # Handle C++ compilation if requested
+    if args.compile_cpp:
+        from source.cpp_engine_wrapper import compile_cpp_engine
+        compile_cpp_engine()
+        import sys
+        sys.exit(0)
+    
+    analyzer = ChessAnalyzer(quiet=args.quiet, use_python=use_python)
     analyzer.run()
