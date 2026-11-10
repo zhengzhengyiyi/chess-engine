@@ -1,4 +1,4 @@
-depth = 3
+depth = 2
 
 # Performance configuration
 use_lazy_smp = False  # Disable Lazy SMP for now (causes GUI issues)

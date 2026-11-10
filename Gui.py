@@ -386,7 +386,11 @@ class ChessGUI:
         engine.chess_to_custom_board(self.board.board)
         
         # Search for best move
-        best_move = engine.search(self.board.board)
+        try:
+            best_move = engine.search(self.board.board)
+        except Exception as e:
+            print(f"Engine search failed: {e}")
+            best_move = None
         
         with self.ai_lock:
             self.searching = False
@@ -429,15 +433,19 @@ class ChessGUI:
         self.ai_thread.start()
     
     def check_game_over(self):
-        """Check if the game is over."""
-        if self.board.board.is_checkmate():
-            winner = "Black" if self.board.board.turn == chess.WHITE else "White"
+        """Check if the game is over (mate, stalemate, or any draw)."""
+        b = self.board.board
+        if b.is_checkmate():
+            winner = "Black" if b.turn == chess.WHITE else "White"
             self.game_over = True
             self.winner = winner
             return True
-        elif self.board.board.is_stalemate():
+        if (b.is_stalemate() or b.is_insufficient_material() or
+                b.is_seventyfive_moves() or b.is_fivefold_repetition() or
+                b.can_claim_threefold_repetition() or
+                b.can_claim_fifty_moves() or b.is_game_over()):
             self.game_over = True
-            self.winner = None
+            self.winner = None  # Draw
             return True
         return False
     
